@@ -1,0 +1,150 @@
+
+<#
+.SYNOPSIS
+  Auditoria de permisos Git en Azure DevOps.
+
+  No realiza push, cambios ni elimina repositorios.
+  Requiere un PAT valido de Azure DevOps.
+#>
+
+param(
+    [string]$Organization = "Deprati",
+    [string]$CsvPath = ".\permisos_azuredevops.csv"
+)
+
+$ErrorActionPreference = "Stop"
+
+$Namespace = "2e9eb7ed-3c0a-47d4-87c1-0ffdd275fd87"
+
+# Permisos oficiales del namespace Git Repositories
+$Permissions = [ordered]@{
+    Read              = 2
+    Contribute        = 4
+    CreateBranch      = 16
+    CreateTag         = 32
+    ForcePush         = 8
+    EditPolicies      = 2048
+    DeleteRepository  = 512
+    ManagePermissions = 8192
+    BypassPolicies    = 128
+}
+
+Write-Host "=== AUDITORIA AZURE DEVOPS ===" -ForegroundColor Cyan
+
+# Solicitar PAT sin mostrarlo
+$SecurePAT = Read-Host "Ingrese PAT de Azure DevOps" -AsSecureString
+
+$Credential = [System.Net.NetworkCredential]::new("", $SecurePAT)
+
+$Auth = [Convert]::ToBase64String(
+    [Text.Encoding]::UTF8.GetBytes(":" + $Credential.Password)
+)
+
+$Headers = @{
+    Authorization = "Basic $Auth"
+    Accept = "application/json"
+}
+
+$BaseUrl = "https://dev.azure.com/$Organization"
+
+try {
+    # 1. Enumerar repositorios accesibles
+    Write-Host "[1] Consultando repositorios..."
+
+    $Repos = Invoke-RestMethod `
+        -Uri "$BaseUrl/_apis/git/repositories?api-version=7.1" `
+        -Headers $Headers `
+        -Method Get
+
+    $Results = @()
+
+    # 2. Evaluar permisos por repositorio
+    foreach ($Repo in @($Repos.value)) {
+
+        Write-Host "Evaluando: $($Repo.name)" -ForegroundColor Yellow
+
+        $SecurityToken = "repoV2/$($Repo.project.id)/$($Repo.id)"
+
+        $Evaluations = @(
+            foreach ($Permission in $Permissions.GetEnumerator()) {
+                @{
+                    securityNamespaceId = $Namespace
+                    token = $SecurityToken
+                    permissions = [int]$Permission.Value
+                }
+            }
+        )
+
+        $Body = @{
+            alwaysAllowAdministrators = $false
+            evaluations = $Evaluations
+        } | ConvertTo-Json -Depth 8
+
+        $Record = [ordered]@{
+            Proyecto = $Repo.project.name
+            Repositorio = $Repo.name
+            URL = $Repo.webUrl
+        }
+
+        try {
+            $Response = Invoke-RestMethod `
+                -Uri "$BaseUrl/_apis/security/permissionevaluationbatch?api-version=7.1" `
+                -Method Post `
+                -Headers $Headers `
+                -ContentType "application/json" `
+                -Body $Body
+
+            foreach ($Permission in $Permissions.GetEnumerator()) {
+
+                $Evaluation = $Response.evaluations |
+                    Where-Object {
+                        $_.permissions -eq $Permission.Value
+                    } |
+                    Select-Object -First 1
+
+                if ($null -eq $Evaluation) {
+                    $Record[$Permission.Key] = "NO EVALUADO"
+                }
+                elseif ($Evaluation.value -eq $true) {
+                    $Record[$Permission.Key] = "SI"
+                }
+                else {
+                    $Record[$Permission.Key] = "NO"
+                }
+            }
+        }
+        catch {
+            Write-Warning "No fue posible evaluar permisos de $($Repo.name)"
+
+            foreach ($Permission in $Permissions.Keys) {
+                $Record[$Permission] = "NO EVALUADO"
+            }
+        }
+
+        $Results += [PSCustomObject]$Record
+    }
+
+    # 3. Exportar evidencia
+    $Results | Export-Csv `
+        -LiteralPath $CsvPath `
+        -NoTypeInformation `
+        -Encoding UTF8
+
+    Write-Host "`n=== RESULTADOS ===" -ForegroundColor Green
+
+    $Results |
+        Format-Table Proyecto, Repositorio, Read,
+                     Contribute, ManagePermissions -AutoSize
+
+    Write-Host "Repositorios encontrados: $($Results.Count)"
+    Write-Host "Evidencia: $CsvPath"
+}
+catch {
+    Write-Host "Error consultando Azure DevOps." -ForegroundColor Red
+    Write-Host "Revise el PAT, su alcance y acceso a la organizacion."
+}
+finally {
+    $Auth = $null
+    $Headers = $null
+    $Credential = $null
+}
